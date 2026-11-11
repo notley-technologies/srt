@@ -490,3 +490,53 @@ TEST(TestConnectionAPI, FastCleanupAfterClose)
 
     EXPECT_LT(elapsed_ms, 500);
 }
+
+// A non-blocking caller must go from SRTS_CONNECTING straight to SRTS_CONNECTED.
+// CUDT::postConnect() used to clear m_bConnecting before setting m_bConnected,
+// and srt_getsockstate() reported SRTS_BROKEN in between (see #508).
+TEST(TestConnectionAPI, NonblockingConnectIsNotReportedBroken)
+{
+    using namespace std::chrono;
+    srt::TestInit srtinit;
+
+    const SRTSOCKET listener_sock = srt_create_socket();
+    ASSERT_NE(listener_sock, SRT_INVALID_SOCK);
+
+    // Bound the blocking accept below.
+    const int accept_timeout_ms = 3000;
+    srt_setsockflag(listener_sock, SRTO_RCVTIMEO, &accept_timeout_ms, sizeof accept_timeout_ms);
+
+    srt::sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+    ASSERT_NE(srt_bind(listener_sock, sa.get(), sa.size()), SRT_ERROR);
+    ASSERT_NE(srt_listen(listener_sock, 16), SRT_ERROR);
+
+    const bool no = false;
+    for (int attempt = 0; attempt < 50; ++attempt)
+    {
+        const SRTSOCKET caller_sock = srt_create_socket();
+        ASSERT_NE(caller_sock, SRT_INVALID_SOCK);
+        srt_setsockflag(caller_sock, SRTO_RCVSYN, &no, sizeof no);
+        ASSERT_NE(srt_connect(caller_sock, sa.get(), sa.size()), SRT_ERROR);
+
+        // Poll the state while the handshake completes, to catch any transient state.
+        SRT_SOCKSTATUS state = SRTS_CONNECTING;
+        const steady_clock::time_point deadline = steady_clock::now() + seconds(3);
+        while (state == SRTS_CONNECTING && steady_clock::now() < deadline)
+            state = srt_getsockstate(caller_sock);
+
+        EXPECT_EQ(state, SRTS_CONNECTED) << "attempt " << attempt << ", reject reason "
+                                         << srt_getrejectreason(caller_sock);
+        if (state != SRTS_CONNECTED)
+        {
+            srt_close(caller_sock);
+            break;
+        }
+
+        const SRTSOCKET accepted_sock = srt_accept(listener_sock, NULL, NULL);
+        EXPECT_NE(accepted_sock, SRT_INVALID_SOCK);
+        srt_close(accepted_sock);
+        srt_close(caller_sock);
+    }
+
+    srt_close(listener_sock);
+}
