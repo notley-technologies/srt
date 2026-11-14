@@ -3855,6 +3855,13 @@ void srt::CUDT::startConnect(const sockaddr_any& serv_addr, int32_t forced_isn)
     m_tsLastReqTime = tnow;
     m_bConnecting = true;
 
+    // Set the status only now, after m_bConnecting: CUDTSocket::getStatus()
+    // reports SRTS_BROKEN for a socket that is SRTS_CONNECTING with neither
+    // m_bConnecting nor m_bConnected set. It must still be set before the
+    // handshake is sent, so that it cannot overwrite the SRTS_CONNECTED that
+    // postConnect() sets once the peer responds.
+    m_parent->m_Status = SRTS_CONNECTING;
+
     // At this point m_SourceAddr is probably default-any, but this function
     // now requires that the address be specified here because there will be
     // no possibility to do it at any next stage of sending.
@@ -5121,9 +5128,6 @@ EConnectStatus srt::CUDT::postConnect(const CPacket* pResponse, bool rendezvous,
         return CONN_REJECT;
     }
 
-    // And, I am connected too.
-    m_bConnecting = false;
-
     // The lock on m_ConnectionLock should still be applied, but
     // the socket could have been started removal before this function
     // has started. Do a sanity check before you continue with the
@@ -5140,6 +5144,12 @@ EConnectStatus srt::CUDT::postConnect(const CPacket* pResponse, bool rendezvous,
         m_pRNode->m_bOnList = true;
         m_pRcvQueue->setNewEntry(this);
     }
+
+    // And, I am connected too. Clear m_bConnecting only after m_bConnected
+    // is set: CUDTSocket::getStatus() reports SRTS_BROKEN for a socket that is
+    // still SRTS_CONNECTING with neither flag set, and locateSocket() above
+    // may wait for m_GlobControlLock.
+    m_bConnecting = false;
 
     // XXX Problem around CONN_CONFUSED!
     // If some too-eager packets were received from a listener

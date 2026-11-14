@@ -2072,12 +2072,6 @@ int srt::CUDTUnited::connectIn(CUDTSocket* s, const sockaddr_any& target_addr, i
         }
     }
 
-    // connect_complete() may be called before connect() returns.
-    // So we need to update the status before connect() is called,
-    // otherwise the status may be overwritten with wrong value
-    // (CONNECTED vs. CONNECTING).
-    s->m_Status = SRTS_CONNECTING;
-
     /*
      * In blocking mode, connect can block for up to 30 seconds for
      * rendez-vous mode. Holding the s->m_ControlLock prevent close
