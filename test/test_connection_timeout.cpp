@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <gtest/gtest.h>
@@ -489,4 +490,80 @@ TEST(TestConnectionAPI, FastCleanupAfterClose)
     const auto elapsed_ms = duration_cast<milliseconds>(steady_clock::now() - start).count();
 
     EXPECT_LT(elapsed_ms, 500);
+}
+
+// A non-blocking caller must go from SRTS_CONNECTING straight to SRTS_CONNECTED,
+// and no thread may see SRTS_BROKEN on the way (see #508). srt_getsockstate()
+// reported SRTS_BROKEN when CUDTUnited::connectIn() set SRTS_CONNECTING before
+// CUDT::startConnect() set m_bConnecting, and when CUDT::postConnect() cleared
+// m_bConnecting before setting m_bConnected.
+TEST(TestConnectionAPI, NonblockingConnectIsNotReportedBroken)
+{
+    using namespace std::chrono;
+    srt::TestInit srtinit;
+
+    const SRTSOCKET listener_sock = srt_create_socket();
+    ASSERT_NE(listener_sock, SRT_INVALID_SOCK);
+
+    // Bound the blocking accept below.
+    const int accept_timeout_ms = 3000;
+    srt_setsockflag(listener_sock, SRTO_RCVTIMEO, &accept_timeout_ms, sizeof accept_timeout_ms);
+
+    srt::sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+    ASSERT_NE(srt_bind(listener_sock, sa.get(), sa.size()), SRT_ERROR);
+    ASSERT_NE(srt_listen(listener_sock, 16), SRT_ERROR);
+
+    const bool no = false;
+    for (int attempt = 0; attempt < 200; ++attempt)
+    {
+        const SRTSOCKET caller_sock = srt_create_socket();
+        ASSERT_NE(caller_sock, SRT_INVALID_SOCK);
+        srt_setsockflag(caller_sock, SRTO_RCVSYN, &no, sizeof no);
+        // Time out later than the 3 s wait below, so that a slow handshake
+        // fails that wait instead of being reported as SRTS_BROKEN.
+        const int connect_timeout_ms = 10000;
+        srt_setsockflag(caller_sock, SRTO_CONNTIMEO, &connect_timeout_ms, sizeof connect_timeout_ms);
+
+        // Another thread polls the state from before srt_connect() is called
+        // until the handshake completes, to catch any transient state.
+        std::atomic<bool> polling(false), done(false), seen_broken(false);
+        std::thread poller([&] {
+            polling = true;
+            while (!done)
+            {
+                if (srt_getsockstate(caller_sock) == SRTS_BROKEN)
+                    seen_broken = true;
+            }
+        });
+        while (!polling)
+            std::this_thread::yield();
+
+        const int connect_result = srt_connect(caller_sock, sa.get(), sa.size());
+
+        // Poll here too: this thread sees the state as soon as srt_connect() returns.
+        SRT_SOCKSTATUS state = SRTS_CONNECTING;
+        const steady_clock::time_point deadline = steady_clock::now() + seconds(3);
+        while (connect_result != SRT_ERROR && state == SRTS_CONNECTING && steady_clock::now() < deadline)
+            state = srt_getsockstate(caller_sock);
+
+        done = true;
+        poller.join();
+
+        EXPECT_NE(connect_result, SRT_ERROR) << "attempt " << attempt;
+        EXPECT_EQ(state, SRTS_CONNECTED) << "attempt " << attempt << ", reject reason "
+                                         << srt_getrejectreason(caller_sock);
+        EXPECT_FALSE(seen_broken) << "attempt " << attempt << ": another thread saw SRTS_BROKEN";
+        if (connect_result == SRT_ERROR || state != SRTS_CONNECTED || seen_broken)
+        {
+            srt_close(caller_sock);
+            break;
+        }
+
+        const SRTSOCKET accepted_sock = srt_accept(listener_sock, NULL, NULL);
+        EXPECT_NE(accepted_sock, SRT_INVALID_SOCK);
+        srt_close(accepted_sock);
+        srt_close(caller_sock);
+    }
+
+    srt_close(listener_sock);
 }
